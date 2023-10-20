@@ -1,10 +1,12 @@
+import math
+from pathlib import Path
 import sys
 sys.path.append('droid_slam')
 
 from tqdm import tqdm
 import numpy as np
 import torch
-import lietorch
+import natsort
 import cv2
 import os
 import glob 
@@ -22,7 +24,7 @@ def show_image(image):
     cv2.imshow('image', image / 255.0)
     cv2.waitKey(1)
 
-def image_stream(imagedir, calib, stride):
+def image_stream(imagedir, depthdir, calib, stride):
     """ image generator """
 
     calib = np.loadtxt(calib, delimiter=" ")
@@ -34,10 +36,13 @@ def image_stream(imagedir, calib, stride):
     K[1,1] = fy
     K[1,2] = cy
 
-    image_list = sorted(os.listdir(imagedir))[::stride]
+    image_list = natsort.natsorted(os.listdir(imagedir))[::stride]
+    depth_list = natsort.natsorted(os.listdir(depthdir))[::stride]
 
-    for t, imfile in enumerate(image_list):
+    for t, (imfile,dfile) in enumerate(zip(image_list,depth_list)):
         image = cv2.imread(os.path.join(imagedir, imfile))
+        depth = cv2.imread(os.path.join(depthdir, dfile),-1)
+
         if len(calib) > 4:
             image = cv2.undistort(image, K, calib[4:])
 
@@ -49,11 +54,16 @@ def image_stream(imagedir, calib, stride):
         image = image[:h1-h1%8, :w1-w1%8]
         image = torch.as_tensor(image).permute(2, 0, 1)
 
+        depth = depth.astype(np.float32)
+        depth = torch.as_tensor(depth)
+        depth = F.interpolate(depth[None,None], (h1, w1)).squeeze()
+        depth = depth[:h1-h1%8, :w1-w1%8]
+
         intrinsics = torch.as_tensor([fx, fy, cx, cy])
         intrinsics[0::2] *= (w1 / w0)
         intrinsics[1::2] *= (h1 / h0)
 
-        yield t, image[None], intrinsics
+        yield t, image[None], depth, intrinsics
 
 
 def save_reconstruction(droid, reconstruction_path):
@@ -80,6 +90,7 @@ def save_reconstruction(droid, reconstruction_path):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--imagedir", type=str, help="path to image directory")
+    parser.add_argument("--depthdir", type=str, help="path to depth directory")
     parser.add_argument("--calib", type=str, help="path to calibration file")
     parser.add_argument("--t0", default=0, type=int, help="starting frame")
     parser.add_argument("--stride", default=3, type=int, help="frame stride")
@@ -115,7 +126,7 @@ if __name__ == '__main__':
         args.upsample = True
 
     tstamps = []
-    for (t, image, intrinsics) in tqdm(image_stream(args.imagedir, args.calib, args.stride)):
+    for (t, image, depth, intrinsics) in tqdm(image_stream(args.imagedir,args.depthdir, args.calib, args.stride)):
         if t < args.t0:
             continue
 
@@ -126,9 +137,9 @@ if __name__ == '__main__':
             args.image_size = [image.shape[2], image.shape[3]]
             droid = Droid(args)
         
-        droid.track(t, image, intrinsics=intrinsics)
+        droid.track(t, image, depth, intrinsics=intrinsics)
 
     if args.reconstruction_path is not None:
         save_reconstruction(droid, args.reconstruction_path)
 
-    traj_est = droid.terminate(image_stream(args.imagedir, args.calib, args.stride))
+    traj_est = droid.terminate(image_stream(args.imagedir, args.depthdir, args.calib, args.stride))
